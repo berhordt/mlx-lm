@@ -157,12 +157,9 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 mask = sparse_mask
 
         # Ensure the indexer cache is evaluated even if the topk_indices are unused
-        # to keep the graph from getting too large.
-        # NOTE: Do NOT reassign cache[0].keys here — mx.depends returns a new
-        # array with private storage, breaking the KVCache buffer chain and
-        # causing stale/zero data at long context (>20k tokens).
-        if self.indexer is not None and cache is not None and cache[1] is not None:
-            mx.eval(cache[1].keys, cache[1].values)
+        # to keep the graph from getting too large
+        if self.indexer is not None and cache is not None and cache[0] is not None:
+            cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
 
         pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:
@@ -247,7 +244,7 @@ class GlmMoeDsaModel(DeepseekV32Model):
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
             if cache[-1] is not None:
-                mx.eval(h)
+                cache[-1][0].keys = mx.depends(cache[-1][0].keys, h)
 
         # Broadcast h while keeping it in the graph
         if pipeline_size > 1:
