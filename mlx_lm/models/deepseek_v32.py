@@ -1,6 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -14,6 +15,68 @@ from .cache import CacheList, KVCache
 from .mla import MultiLinear
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
+
+
+# Diagnostic instrumentation for the GLM-5.2 DSA long-context token-0 loop.
+# All gated behind env vars; no-op unless enabled. NOTE: for tensor-parallel
+# runs GLM_DSA_TRACE must be set on EVERY rank (the trace forces a mid-graph
+# sync that all ranks must participate in).
+_GLM_DSA_TRACE = os.environ.get("GLM_DSA_TRACE") is not None
+_GLM_DSA_FP32_INDEXER = os.environ.get("GLM_DSA_FP32_INDEXER") is not None
+# Prefill indexer calls only trace once the key space exceeds this size, so
+# early prefill does not spam the log; decode (s == 1) always traces.
+_GLM_DSA_TRACE_MIN_KEYS = 30000
+
+
+def _trace_indexer_stats(
+    layer_idx: int,
+    topk_indices: mx.array,
+    scores: mx.array,
+    num_keys: int,
+    offset: int,
+    seq_len: int,
+) -> None:
+    """Instrument 3: dump sparse top-k selection stats for one indexer call.
+
+    This forces evaluation of the arrays, which in a distributed run creates a
+    sync point that all ranks must hit together (hence the env-var requirement
+    above). Wrapped in try/except so a trace failure never breaks generation.
+    """
+    if not _GLM_DSA_TRACE:
+        return
+    if seq_len != 1 and num_keys < _GLM_DSA_TRACE_MIN_KEYS:
+        return
+    try:
+        idxs = topk_indices.reshape(-1).astype(mx.int32)
+        mn = int(mx.min(idxs).item())
+        mx_ = int(mx.max(idxs).item())
+        n_sink = int((idxs < 4).sum().item())
+        n_recent = int((idxs > num_keys - 129).sum().item())
+        n_bad = int(((idxs < 0) | (idxs >= num_keys)).sum().item())
+        n_pos_inf = int((scores == mx.array(float("inf"), scores.dtype)).sum().item())
+        n_neg_inf = int((scores == mx.array(-float("inf"), scores.dtype)).sum().item())
+        finite = mx.isfinite(scores)
+        s_sum = float(
+            mx.sum(mx.where(finite, scores, mx.array(0.0, scores.dtype))).item()
+        )
+        s_cnt = int(finite.sum().item())
+        s_mean = s_sum / s_cnt if s_cnt else float("nan")
+        s_max = float(
+            mx.max(
+                mx.where(finite, scores, mx.array(-float("inf"), scores.dtype))
+            ).item()
+        )
+        print(
+            f"[GLM_DSA_TRACE] idxer layer={layer_idx} s={seq_len} offset={offset} "
+            f"keys={num_keys} topk={topk_indices.shape[-1]} min={mn} max={mx_} "
+            f"sink={n_sink} recent={n_recent} bad={n_bad} +inf={n_pos_inf} "
+            f"-inf={n_neg_inf} score_max={s_max:.4f} score_mean={s_mean:.4f}"
+        )
+    except Exception as e:  # pragma: no cover
+        print(
+            f"[GLM_DSA_TRACE] idxer layer={layer_idx} s={seq_len} ERROR "
+            f"{type(e).__name__}: {e}"
+        )
 
 
 @dataclass
@@ -55,6 +118,7 @@ class ModelArgs(BaseModelArgs):
 class Indexer(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
+        self.layer_idx = -1
         self.dim = args.hidden_size
         self.n_heads = args.index_n_heads
         self.head_dim = args.index_head_dim
@@ -107,11 +171,25 @@ class Indexer(nn.Module):
         q = q.reshape(b, s, self.n_heads, self.head_dim).swapaxes(1, 2)
         q = self.rope(q, offset=offset)
 
-        scores = q @ k.swapaxes(-1, -2)
+        if _GLM_DSA_FP32_INDEXER:
+            # Instrument 5: recompute the indexer scores in fp32 to isolate
+            # bf16 precision issues in the top-k selection at long context.
+            q_scores = q.astype(mx.float32)
+            k_scores = k.astype(mx.float32)
+            w_scores = self.weights_proj(x).astype(mx.float32) * (
+                self.n_heads**-0.5 * self.softmax_scale
+            )
+        else:
+            q_scores = q
+            k_scores = k
+            w_scores = self.weights_proj(x) * (
+                self.n_heads**-0.5 * self.softmax_scale
+            )
+
+        scores = q_scores @ k_scores.swapaxes(-1, -2)
         scores = mx.maximum(scores, 0)
-        weights = self.weights_proj(x) * (self.n_heads**-0.5 * self.softmax_scale)
-        weights = weights.swapaxes(-1, -2)[..., None]
-        scores = scores * weights
+        w_scores = w_scores.swapaxes(-1, -2)[..., None]
+        scores = scores * w_scores
         scores = scores.sum(axis=1, keepdims=True)
         if mask is not None:
             scores = mx.where(mask, scores, -float("inf"))
@@ -146,9 +224,15 @@ class Indexer(nn.Module):
             scores,
         )
 
-        return mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
+        topk_indices = mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
             ..., -self.index_topk :
         ]
+
+        _trace_indexer_stats(
+            self.layer_idx, topk_indices, scores, num_keys, offset, s
+        )
+
+        return topk_indices
 
 
 class DeepseekV32Attention(nn.Module):
@@ -204,6 +288,7 @@ class DeepseekV32Attention(nn.Module):
                     self.scale = self.scale * s * s
 
         self.indexer = Indexer(config)
+        self.indexer.layer_idx = getattr(self, "layer_idx", -1)
         self.rope = initialize_rope(
             dims=self.qk_rope_head_dim,
             base=self.rope_theta,

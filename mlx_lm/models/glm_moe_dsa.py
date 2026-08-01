@@ -1,5 +1,6 @@
 # Copyright © 2025 Apple Inc.
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -13,6 +14,13 @@ from .deepseek_v32 import (
     DeepseekV32Model,
 )
 from .deepseek_v32 import Model as DSV32Model
+
+
+# Diagnostic instrumentation for the GLM-5.2 DSA long-context token-0 loop.
+# Instrument 4: bypass sparse top-k selection at decode (L == 1) and attend to
+# all cached keys, to isolate whether the indexer selection or the cached KV /
+# main attention is at fault. No-op unless GLM_DSA_FULL_ATTENTION is set.
+_GLM_DSA_FULL_ATTENTION = os.environ.get("GLM_DSA_FULL_ATTENTION") is not None
 
 
 @dataclass
@@ -80,9 +88,12 @@ class ModelArgs(BaseModelArgs):
 class GlmMoeDsaAttention(DeepseekV32Attention):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__(config)
+        self.layer_idx = layer_idx
         self.skip_topk = config.indexer_types[layer_idx] == "shared"
         if self.skip_topk:
             self.indexer = None
+        else:
+            self.indexer.layer_idx = layer_idx
 
     def __call__(
         self,
@@ -119,7 +130,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         else:
             topk_indices = prev_topk_indices
 
-        if topk_indices is not None:
+        if topk_indices is not None and not (_GLM_DSA_FULL_ATTENTION and L == 1):
             if L == 1:
                 idx = topk_indices[:, :, 0, :, None]
                 kv_latent = mx.take_along_axis(
