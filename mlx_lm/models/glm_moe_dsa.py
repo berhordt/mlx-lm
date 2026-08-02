@@ -207,6 +207,17 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
 
+        if _GLM_DSA_TRACE and self.layer_idx == 3 and L > 1:
+            # SDPA dispatch + content-score magnitude (overflow check).
+            qk = (q_nope * self.scale) @ k.swapaxes(-1, -2)
+            qk_max = float(mx.max(qk).item())
+            qk_min = float(mx.min(qk).item())
+            print(
+                f"[GLM_DSA_TRACE] L={L} layer 3: q_nope{q_nope.shape} k{k.shape} "
+                f"v{v.shape} pe_scores{pe_scores.shape} "
+                f"content_max={qk_max:.4e} content_min={qk_min:.4e}"
+            )
+
         output = scaled_dot_product_attention(
             q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
