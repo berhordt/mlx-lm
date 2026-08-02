@@ -192,6 +192,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
 class GlmMoeDsaDecoderLayer(DeepseekV32DecoderLayer):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__(config, layer_idx)
+        self.layer_idx = layer_idx
         self.self_attn = GlmMoeDsaAttention(config, layer_idx)
 
     def __call__(
@@ -205,7 +206,13 @@ class GlmMoeDsaDecoderLayer(DeepseekV32DecoderLayer):
             self.input_layernorm(x), mask, cache, prev_topk_indices
         )
         h = x + r
+        if _GLM_DSA_TRACE and not mx.isfinite(h).all().item():
+            # Attention (or residual) produced NaN before the MLP.
+            print(f"[GLM_DSA_TRACE] layer {self.layer_idx}: attn output NOT finite")
         r = self.mlp(self.post_attention_layernorm(h))
+        if _GLM_DSA_TRACE and not mx.isfinite(r).all().item():
+            # MLP/MoE produced NaN on a (finite) pre-MLP hidden state.
+            print(f"[GLM_DSA_TRACE] layer {self.layer_idx}: MLP/MoE output NOT finite")
         return h + r, topk_indices
 
 
