@@ -178,7 +178,19 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 ("pe_scores", pe_scores),
             ):
                 if arr is not None and not mx.isfinite(arr).all().item():
-                    print(f"[GLM_DSA_TRACE] layer 3 tensor {name}: NOT finite")
+                    print(f"[GLM_DSA_TRACE] L={L} layer 3 tensor {name}: NOT finite")
+            if L > 1 and topk_indices is not None:
+                ti = topk_indices.reshape(-1).astype(mx.int32)
+                print(
+                    f"[GLM_DSA_TRACE] L={L} layer 3: topk min={int(mx.min(ti).item())} "
+                    f"max={int(mx.max(ti).item())} n={ti.size} "
+                    f"keys={kv_latent.shape[2]}"
+                )
+            if isinstance(mask, mx.array) and mask.dtype == mx.bool_ and L > 1:
+                rows = mask.reshape(L, -1)
+                n_all_false = int((rows.sum(axis=-1) == 0).sum().item())
+                if n_all_false:
+                    print(f"[GLM_DSA_TRACE] L={L} layer 3: mask all_false_rows={n_all_false}/{L}")
 
         if L == 1:
             q_nope = self.embed_q(q_nope)
@@ -190,6 +202,9 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         output = scaled_dot_product_attention(
             q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
+        if _GLM_DSA_TRACE and self.layer_idx == 3:
+            if not mx.isfinite(output).all().item():
+                print(f"[GLM_DSA_TRACE] L={L} layer 3: SDPA output NOT finite")
         if L == 1:
             output = self.unembed_out(output)
 
