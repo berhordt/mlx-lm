@@ -186,6 +186,14 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                     f"max={int(mx.max(ti).item())} n={ti.size} "
                     f"keys={kv_latent.shape[2]}"
                 )
+            if L > 1:
+                ps_min = float(mx.min(pe_scores).item())
+                ps_max = float(mx.max(pe_scores).item())
+                ps_absmax = float(mx.max(mx.abs(pe_scores)).item())
+                print(
+                    f"[GLM_DSA_TRACE] L={L} layer 3: pe_scores min={ps_min:.4e} "
+                    f"max={ps_max:.4e} absmax={ps_absmax:.4e}"
+                )
             if isinstance(mask, mx.array) and mask.dtype == mx.bool_ and L > 1:
                 rows = mask.reshape(L, -1)
                 n_all_false = int((rows.sum(axis=-1) == 0).sum().item())
