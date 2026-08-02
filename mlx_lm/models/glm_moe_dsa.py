@@ -22,6 +22,7 @@ from .deepseek_v32 import Model as DSV32Model
 # main attention is at fault. No-op unless GLM_DSA_FULL_ATTENTION is set.
 _GLM_DSA_FULL_ATTENTION = os.environ.get("GLM_DSA_FULL_ATTENTION") is not None
 _GLM_DSA_TRACE = os.environ.get("GLM_DSA_TRACE") is not None
+_GLM_DSA_FP32_SDPA = os.environ.get("GLM_DSA_FP32_SDPA") is not None
 
 
 @dataclass
@@ -218,9 +219,21 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 f"content_max={qk_max:.4e} content_min={qk_min:.4e}"
             )
 
+        if _GLM_DSA_FP32_SDPA:
+            # Test/fix: compute attention in fp32 to rule out bf16 precision
+            # issues at long key counts (N=2^15).
+            q_s = q_nope.astype(mx.float32)
+            k_s = k.astype(mx.float32)
+            v_s = v.astype(mx.float32)
+            mask_s = pe_scores.astype(mx.float32)
+        else:
+            q_s, k_s, v_s, mask_s = q_nope, k, v, pe_scores
+
         output = scaled_dot_product_attention(
-            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
+            q_s, k_s, v_s, cache=cache, scale=self.scale, mask=mask_s
         )
+        if _GLM_DSA_FP32_SDPA:
+            output = output.astype(mx.bfloat16)
         if _GLM_DSA_TRACE and self.layer_idx == 3:
             if not mx.isfinite(output).all().item():
                 print(f"[GLM_DSA_TRACE] L={L} layer 3: SDPA output NOT finite")
