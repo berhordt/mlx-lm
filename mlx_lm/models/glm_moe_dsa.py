@@ -218,6 +218,20 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 f"v{v.shape} pe_scores{pe_scores.shape} "
                 f"content_max={qk_max:.4e} content_min={qk_min:.4e}"
             )
+            # Replicate the fast-SDPA fallback (q_head_dim != v_head_dim) to
+            # find the exact step that produces NaN.
+            fscores = qk + pe_scores
+            fs_ok = bool(mx.isfinite(fscores).all().item())
+            fsm = mx.softmax(fscores, axis=-1, precise=True)
+            fsm_ok = bool(mx.isfinite(fsm).all().item())
+            fout = fsm @ v
+            fout_ok = bool(mx.isfinite(fout).all().item())
+            print(
+                f"[GLM_DSA_TRACE] L={L} layer 3 fallback: scores_finite={fs_ok} "
+                f"scores_max={float(mx.max(fscores).item()):.3e} "
+                f"scores_min={float(mx.min(fscores).item()):.3e} "
+                f"softmax_finite={fsm_ok} out_finite={fout_ok}"
+            )
 
         if _GLM_DSA_FP32_SDPA:
             # Test/fix: compute attention in fp32 to rule out bf16 precision
