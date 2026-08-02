@@ -21,6 +21,7 @@ from .deepseek_v32 import Model as DSV32Model
 # all cached keys, to isolate whether the indexer selection or the cached KV /
 # main attention is at fault. No-op unless GLM_DSA_FULL_ATTENTION is set.
 _GLM_DSA_FULL_ATTENTION = os.environ.get("GLM_DSA_FULL_ATTENTION") is not None
+_GLM_DSA_TRACE = os.environ.get("GLM_DSA_TRACE") is not None
 
 
 @dataclass
@@ -241,6 +242,13 @@ class GlmMoeDsaModel(DeepseekV32Model):
             h, prev_topk_indices = self.layers[self.start_idx + i](
                 h, mask, cache[i], prev_topk_indices
             )
+            if _GLM_DSA_TRACE and not mx.isfinite(h).all().item():
+                # Pinpoint the first layer whose hidden state becomes NaN/Inf
+                # (forces a sync; trace-only).
+                print(
+                    f"[GLM_DSA_TRACE] layer {self.start_idx + i}: "
+                    f"hidden state NOT finite"
+                )
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
