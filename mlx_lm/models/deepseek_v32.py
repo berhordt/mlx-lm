@@ -364,11 +364,6 @@ class DeepseekV32Attention(nn.Module):
                 if mask is not None:
                     sparse_mask = sparse_mask & mask
                 mask = sparse_mask
-        # Ensure the indexer cache is evaluated even if the topk_indices are unused
-        # to keep the graph from getting too large
-        if cache is not None and cache[0] is not None:
-            cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
-
         pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:
             pe_scores = mx.where(
@@ -391,6 +386,13 @@ class DeepseekV32Attention(nn.Module):
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        # Keep the indexer cache in the output graph (so it is evaluated with
+        # the model output) WITHOUT rebinding cache[0].keys: mx.depends returns
+        # a new array with private storage, and rebinding detaches the KVCache
+        # buffer, corrupting writes at long-context growth boundaries (NaN KV
+        # -> token-0 loop at ~2^15 tokens).
+        if cache is not None and cache[0] is not None:
+            output = mx.depends(output, (cache[1].keys, cache[1].values))
         return self.o_proj(output)
 
 
@@ -600,8 +602,9 @@ class DeepseekV32Model(nn.Module):
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
-            if cache[-1] is not None:
-                cache[-1][0].keys = mx.depends(cache[-1][0].keys, h)
+            # Force the send to complete without rebinding cache[-1] keys
+            # (rebinding detaches the KVCache buffer -> NaN corruption).
+            mx.eval(h)
 
         # Broadcast h while keeping it in the graph
         if pipeline_size > 1:
