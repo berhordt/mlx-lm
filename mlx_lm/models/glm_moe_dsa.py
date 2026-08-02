@@ -167,39 +167,32 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             )
 
         if _GLM_DSA_TRACE and self.layer_idx == 3:
-            # Pinpoint the first tensor that goes non-finite in the failing
-            # layer (forces a sync; layer-3 only to keep it cheap).
-            for name, arr in (
-                ("x", x),
-                ("qr", qr),
-                ("q_nope", q_nope),
-                ("q_pe", q_pe),
-                ("kv_latent", kv_latent),
-                ("k_pe", k_pe),
-                ("pe_scores", pe_scores),
-            ):
-                if arr is not None and not mx.isfinite(arr).all().item():
-                    print(f"[GLM_DSA_TRACE] L={L} layer 3 tensor {name}: NOT finite")
+            # Memory-light subset diagnostics (head 0, first 64 queries, last
+            # 256 keys) so the trace adds ~tens of MB, not ~13 GB/rank.
+
+            def _finite(name: str, arr, sl) -> None:
+                if arr is not None:
+                    try:
+                        ok = bool(mx.isfinite(arr[sl]).all().item())
+                    except Exception:  # pragma: no cover
+                        ok = "ERR"
+                    if ok is not True:
+                        print(f"[GLM_DSA_TRACE] L={L} layer 3 {name}[{sl}]: finite={ok}")
+
+            _finite("x", x, (slice(0, 1), slice(0, 64)))
+            _finite("qr", qr, (slice(0, 1), slice(0, 64)))
+            _finite("q_nope", q_nope, (0, 0, slice(0, 64)))
+            _finite("q_pe", q_pe, (0, 0, slice(0, 64)))
+            _finite("kv_latent", kv_latent, (0, 0, slice(-256, None)))
+            _finite("k_pe", k_pe, (0, 0, slice(-256, None)))
+            _finite("pe_scores", pe_scores, (0, 0, slice(0, 64)))
+
             if L > 1 and topk_indices is not None:
-                ti = topk_indices.reshape(-1).astype(mx.int32)
+                ti = topk_indices[..., :64, :].reshape(-1).astype(mx.int32)
                 print(
                     f"[GLM_DSA_TRACE] L={L} layer 3: topk min={int(mx.min(ti).item())} "
-                    f"max={int(mx.max(ti).item())} n={ti.size} "
-                    f"keys={kv_latent.shape[2]}"
+                    f"max={int(mx.max(ti).item())} keys={kv_latent.shape[2]}"
                 )
-            if L > 1:
-                ps_min = float(mx.min(pe_scores).item())
-                ps_max = float(mx.max(pe_scores).item())
-                ps_absmax = float(mx.max(mx.abs(pe_scores)).item())
-                print(
-                    f"[GLM_DSA_TRACE] L={L} layer 3: pe_scores min={ps_min:.4e} "
-                    f"max={ps_max:.4e} absmax={ps_absmax:.4e}"
-                )
-            if isinstance(mask, mx.array) and mask.dtype == mx.bool_ and L > 1:
-                rows = mask.reshape(L, -1)
-                n_all_false = int((rows.sum(axis=-1) == 0).sum().item())
-                if n_all_false:
-                    print(f"[GLM_DSA_TRACE] L={L} layer 3: mask all_false_rows={n_all_false}/{L}")
 
         if L == 1:
             q_nope = self.embed_q(q_nope)
@@ -209,27 +202,20 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             v = self.unembed_out(kv_latent)
 
         if _GLM_DSA_TRACE and self.layer_idx == 3 and L > 1:
-            # SDPA dispatch + content-score magnitude (overflow check).
-            qk = (q_nope * self.scale) @ k.swapaxes(-1, -2)
-            qk_max = float(mx.max(qk).item())
-            qk_min = float(mx.min(qk).item())
-            print(
-                f"[GLM_DSA_TRACE] L={L} layer 3: q_nope{q_nope.shape} k{k.shape} "
-                f"v{v.shape} pe_scores{pe_scores.shape} "
-                f"content_max={qk_max:.4e} content_min={qk_min:.4e}"
-            )
-            # Replicate the fast-SDPA fallback (q_head_dim != v_head_dim) to
-            # find the exact step that produces NaN.
-            fscores = qk + pe_scores
-            fs_ok = bool(mx.isfinite(fscores).all().item())
-            fsm = mx.softmax(fscores, axis=-1, precise=True)
+            # Replicate the fast-SDPA fallback on a subset (head 0, first 64
+            # queries, all keys) to find the NaN step without OOM.
+            qk = (q_nope[0, 0, :64] * self.scale) @ k[0, 0].swapaxes(-1, -2)
+            ps = pe_scores[0, 0, :64]
+            fs = qk + ps
+            fs_ok = bool(mx.isfinite(fs).all().item())
+            fsm = mx.softmax(fs, axis=-1, precise=True)
             fsm_ok = bool(mx.isfinite(fsm).all().item())
-            fout = fsm @ v
+            fout = fsm @ v[0, 0]
             fout_ok = bool(mx.isfinite(fout).all().item())
             print(
-                f"[GLM_DSA_TRACE] L={L} layer 3 fallback: scores_finite={fs_ok} "
-                f"scores_max={float(mx.max(fscores).item()):.3e} "
-                f"scores_min={float(mx.min(fscores).item()):.3e} "
+                f"[GLM_DSA_TRACE] L={L} layer 3 fallback(sub): scores_finite={fs_ok} "
+                f"scores_max={float(mx.max(fs).item()):.3e} "
+                f"scores_min={float(mx.min(fs).item()):.3e} "
                 f"softmax_finite={fsm_ok} out_finite={fout_ok}"
             )
 
@@ -282,13 +268,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV32DecoderLayer):
             self.input_layernorm(x), mask, cache, prev_topk_indices
         )
         h = x + r
-        if _GLM_DSA_TRACE and not mx.isfinite(h).all().item():
-            # Attention (or residual) produced NaN before the MLP.
-            print(f"[GLM_DSA_TRACE] layer {self.layer_idx}: attn output NOT finite")
         r = self.mlp(self.post_attention_layernorm(h))
-        if _GLM_DSA_TRACE and not mx.isfinite(r).all().item():
-            # MLP/MoE produced NaN on a (finite) pre-MLP hidden state.
-            print(f"[GLM_DSA_TRACE] layer {self.layer_idx}: MLP/MoE output NOT finite")
         return h + r, topk_indices
 
 
@@ -325,13 +305,6 @@ class GlmMoeDsaModel(DeepseekV32Model):
             h, prev_topk_indices = self.layers[self.start_idx + i](
                 h, mask, cache[i], prev_topk_indices
             )
-            if _GLM_DSA_TRACE and not mx.isfinite(h).all().item():
-                # Pinpoint the first layer whose hidden state becomes NaN/Inf
-                # (forces a sync; trace-only).
-                print(
-                    f"[GLM_DSA_TRACE] layer {self.start_idx + i}: "
-                    f"hidden state NOT finite"
-                )
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
