@@ -165,6 +165,21 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
             )
 
+        if _GLM_DSA_TRACE and self.layer_idx == 3:
+            # Pinpoint the first tensor that goes non-finite in the failing
+            # layer (forces a sync; layer-3 only to keep it cheap).
+            for name, arr in (
+                ("x", x),
+                ("qr", qr),
+                ("q_nope", q_nope),
+                ("q_pe", q_pe),
+                ("kv_latent", kv_latent),
+                ("k_pe", k_pe),
+                ("pe_scores", pe_scores),
+            ):
+                if arr is not None and not mx.isfinite(arr).all().item():
+                    print(f"[GLM_DSA_TRACE] layer 3 tensor {name}: NOT finite")
+
         if L == 1:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
