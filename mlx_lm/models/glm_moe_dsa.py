@@ -229,7 +229,19 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 f"splitK_finite={split_ok}"
             )
 
-        if _GLM_DSA_WORKAROUND and L > 1:
+        if _GLM_DSA_WORKAROUND == "pad" and L > 1:
+            # Force the FUSED SDPA kernel (use_fallback=false) by padding the
+            # q/k head dim (192 -> 256) to match v. The fallback's final
+            # matmul NaNs at N=2^15 with layer-3 values; the fused kernel is a
+            # different code path and may avoid it. Padding with zeros leaves
+            # q@k^T unchanged.
+            pad_n = v.shape[-1] - q_nope.shape[-1]
+            q_p = mx.pad(q_nope, ((0, 0), (0, 0), (0, 0), (0, pad_n)))
+            k_p = mx.pad(k, ((0, 0), (0, 0), (0, 0), (0, pad_n)))
+            output = scaled_dot_product_attention(
+                q_p, k_p, v, cache=cache, scale=self.scale, mask=pe_scores
+            )
+        elif _GLM_DSA_WORKAROUND and L > 1:
             # Manual SDPA fallback (mirrors mx.fast's generic path) with
             # value-level workarounds for the N=2^15 matmul NaN.
             # Modes: manual (repro), flush (zero subnormal probs),
@@ -237,6 +249,14 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             scores = (q_nope * self.scale) @ k.swapaxes(-1, -2)
             scores = scores + pe_scores
             fsm = mx.softmax(scores, axis=-1, precise=True)
+            if _GLM_DSA_TRACE and self.layer_idx == 3:
+                # Memory-light: strided sample over all heads/queries to check
+                # whether the NaN exists in softmax rows outside the subset.
+                fsm_s = fsm[:, :, ::128, :]
+                print(
+                    f"[GLM_DSA_TRACE] L={L} layer 3 wb={_GLM_DSA_WORKAROUND}: "
+                    f"fsm_strided_finite={bool(mx.isfinite(fsm_s).all().item())}"
+                )
             if _GLM_DSA_WORKAROUND in ("flush", "both"):
                 # bf16 subnormal probabilities (~<1e-38) mishandled by the
                 # matmul kernel at large K -> NaN. Flush them to zero.
