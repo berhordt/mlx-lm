@@ -228,6 +228,23 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 f"softmax_finite={fsm_ok} out_finite={fout_ok} "
                 f"splitK_finite={split_ok}"
             )
+            if not fout_ok and pe_scores.shape[-1] == 32768:
+                # Dump the actual tensors (mx.save_safetensors, no numpy) for
+                # offline reproduction of the matmul NaN.
+                try:
+                    mx.save_safetensors(
+                        "/tmp/l3.safetensors",
+                        {
+                            "fsm": fsm.astype(mx.float16),
+                            "v": v[0, 0].astype(mx.float16),
+                            "q": q_nope[0, 0, :64].astype(mx.float16),
+                            "k": k[0, 0].astype(mx.float16),
+                            "pe": pe_scores[0, 0, :64].astype(mx.float16),
+                        },
+                    )
+                    print("[GLM_DSA_TRACE] dumped /tmp/l3.safetensors")
+                except Exception as e:  # pragma: no cover
+                    print(f"[GLM_DSA_TRACE] dump failed: {e}")
 
         if _GLM_DSA_WORKAROUND == "pad" and L > 1:
             # Force the FUSED SDPA kernel (use_fallback=false) by padding the
