@@ -212,11 +212,19 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             fsm_ok = bool(mx.isfinite(fsm).all().item())
             fout = fsm @ v[0, 0]
             fout_ok = bool(mx.isfinite(fout).all().item())
+            # Test split-K workaround for the 2^15 matmul NaN: reduce over the
+            # key dim in two halves so no single matmul has K=32768.
+            N2 = pe_scores.shape[-1] // 2
+            fout_a = fsm[:, :N2] @ v[0, 0][:N2]
+            fout_b = fsm[:, N2:] @ v[0, 0][N2:]
+            fout_split = fout_a + fout_b
+            split_ok = bool(mx.isfinite(fout_split).all().item())
             print(
                 f"[GLM_DSA_TRACE] L={L} layer 3 fallback(sub): scores_finite={fs_ok} "
                 f"scores_max={float(mx.max(fs).item()):.3e} "
                 f"scores_min={float(mx.min(fs).item()):.3e} "
-                f"softmax_finite={fsm_ok} out_finite={fout_ok}"
+                f"softmax_finite={fsm_ok} out_finite={fout_ok} "
+                f"splitK_finite={split_ok}"
             )
 
         if _GLM_DSA_FP32_SDPA:
