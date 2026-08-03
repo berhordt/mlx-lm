@@ -219,18 +219,6 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             fout_b = fsm[:, N2:] @ v[0, 0][N2:]
             fout_split = fout_a + fout_b
             split_ok = bool(mx.isfinite(fout_split).all().item())
-            if not fout_ok and pe_scores.shape[-1] == 32768:
-                # Dump the actual tensors for offline reproduction.
-                try:
-                    import numpy as np
-                    np.save("/tmp/l3_fsm.npy", np.array(fsm.astype(mx.float16)))
-                    np.save("/tmp/l3_v.npy", np.array(v[0, 0].astype(mx.float16)))
-                    np.save("/tmp/l3_q.npy", np.array(q_nope[0, 0, :64].astype(mx.float16)))
-                    np.save("/tmp/l3_k.npy", np.array(k[0, 0].astype(mx.float16)))
-                    np.save("/tmp/l3_pe.npy", np.array(pe_scores[0, 0, :64].astype(mx.float16)))
-                    print("[GLM_DSA_TRACE] dumped /tmp/l3_*.npy")
-                except Exception as e:  # pragma: no cover
-                    print(f"[GLM_DSA_TRACE] dump failed: {e}")
             print(
                 f"[GLM_DSA_TRACE] L={L} layer 3 fallback(sub): scores_finite={fs_ok} "
                 f"scores_max={float(mx.max(fs).item()):.3e} "
