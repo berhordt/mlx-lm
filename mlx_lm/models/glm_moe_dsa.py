@@ -23,6 +23,8 @@ from .deepseek_v32 import Model as DSV32Model
 _GLM_DSA_FULL_ATTENTION = os.environ.get("GLM_DSA_FULL_ATTENTION") is not None
 _GLM_DSA_TRACE = os.environ.get("GLM_DSA_TRACE") is not None
 _GLM_DSA_FP32_SDPA = os.environ.get("GLM_DSA_FP32_SDPA") is not None
+# Workaround mode for the N=2^15 matmul NaN: "", "manual", "flush", "fp32mm", "both".
+_GLM_DSA_WORKAROUND = os.environ.get("GLM_DSA_WORKAROUND", "")
 
 
 @dataclass
@@ -227,21 +229,43 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 f"splitK_finite={split_ok}"
             )
 
-        if _GLM_DSA_FP32_SDPA:
+        if _GLM_DSA_WORKAROUND and L > 1:
+            # Manual SDPA fallback (mirrors mx.fast's generic path) with
+            # value-level workarounds for the N=2^15 matmul NaN.
+            # Modes: manual (repro), flush (zero subnormal probs),
+            # fp32mm (final matmul in fp32), both.
+            scores = (q_nope * self.scale) @ k.swapaxes(-1, -2)
+            scores = scores + pe_scores
+            fsm = mx.softmax(scores, axis=-1, precise=True)
+            if _GLM_DSA_WORKAROUND in ("flush", "both"):
+                # bf16 subnormal probabilities (~<1e-38) mishandled by the
+                # matmul kernel at large K -> NaN. Flush them to zero.
+                fsm = mx.where(
+                    mx.abs(fsm) < 1e-38,
+                    mx.array(0.0, fsm.dtype),
+                    fsm,
+                )
+            if _GLM_DSA_WORKAROUND in ("fp32mm", "both"):
+                output = (fsm.astype(mx.float32) @ v.astype(mx.float32)).astype(
+                    mx.bfloat16
+                )
+            else:
+                output = fsm @ v
+        elif _GLM_DSA_FP32_SDPA:
             # Test/fix: compute attention in fp32 to rule out bf16 precision
             # issues at long key counts (N=2^15).
             q_s = q_nope.astype(mx.float32)
             k_s = k.astype(mx.float32)
             v_s = v.astype(mx.float32)
             mask_s = pe_scores.astype(mx.float32)
-        else:
-            q_s, k_s, v_s, mask_s = q_nope, k, v, pe_scores
-
-        output = scaled_dot_product_attention(
-            q_s, k_s, v_s, cache=cache, scale=self.scale, mask=mask_s
-        )
-        if _GLM_DSA_FP32_SDPA:
+            output = scaled_dot_product_attention(
+                q_s, k_s, v_s, cache=cache, scale=self.scale, mask=mask_s
+            )
             output = output.astype(mx.bfloat16)
+        else:
+            output = scaled_dot_product_attention(
+                q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
+            )
         if _GLM_DSA_TRACE and self.layer_idx == 3:
             if not mx.isfinite(output).all().item():
                 print(f"[GLM_DSA_TRACE] L={L} layer 3: SDPA output NOT finite")
