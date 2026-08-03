@@ -190,10 +190,14 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             _finite("pe_scores", pe_scores, (0, 0, slice(0, 64)))
 
             if L > 1 and topk_indices is not None:
-                ti = topk_indices[..., :64, :].reshape(-1).astype(mx.int32)
+                ti = topk_indices.reshape(-1).astype(mx.int64)
+                ti_min = int(mx.min(ti).item())
+                ti_max = int(mx.max(ti).item())
+                nkeys = kv_latent.shape[2]
+                n_oob = int(((ti < 0) | (ti >= nkeys)).sum().item())
                 print(
-                    f"[GLM_DSA_TRACE] L={L} layer 3: topk min={int(mx.min(ti).item())} "
-                    f"max={int(mx.max(ti).item())} keys={kv_latent.shape[2]}"
+                    f"[GLM_DSA_TRACE] L={L} layer 3: topk min={ti_min} max={ti_max} "
+                    f"keys={nkeys} n={ti.size} OOB={n_oob}"
                 )
 
         if L == 1:
