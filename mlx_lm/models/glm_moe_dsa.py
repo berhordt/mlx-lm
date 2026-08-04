@@ -208,6 +208,15 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             v = self.unembed_out(kv_latent)
 
         if _GLM_DSA_TRACE and self.layer_idx == 3 and L > 1:
+            # Is v already corrupted right after unembed_out (before the
+            # fallback replication runs)?
+            try:
+                v_fin = bool(mx.isfinite(v[0, 0]).all().item())
+            except Exception:  # pragma: no cover
+                v_fin = "ERR"
+            print(f"[GLM_DSA_TRACE] L={L} layer 3: v-after-unembed finite={v_fin}")
+
+        if _GLM_DSA_TRACE and self.layer_idx == 3 and L > 1:
             # Replicate the fast-SDPA fallback on a subset (head 0, first 64
             # queries, all keys) to find the NaN step without OOM.
             qk = (q_nope[0, 0, :64] * self.scale) @ k[0, 0].swapaxes(-1, -2)
