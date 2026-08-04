@@ -233,17 +233,18 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 f"splitK_finite={split_ok}"
             )
             if not fout_ok and pe_scores.shape[-1] == 32768:
-                # Dump the actual tensors (mx.save_safetensors, no numpy) for
-                # offline reproduction of the matmul NaN.
+                # Dump the actual tensors (bf16, no fp16 conversion which
+                # overflows finfo.min -> -inf) for offline reproduction.
                 try:
                     mx.save_safetensors(
                         "/tmp/l3.safetensors",
                         {
-                            "fsm": fsm.astype(mx.float16),
-                            "v": v[0, 0].astype(mx.float16),
-                            "q": q_nope[0, 0, :64].astype(mx.float16),
-                            "k": k[0, 0].astype(mx.float16),
-                            "pe": pe_scores[0, 0, :64].astype(mx.float16),
+                            "fsm": fsm,
+                            "v": v[0, 0],
+                            "q": q_nope[0, 0, :64],
+                            "k": k[0, 0],
+                            "pe": pe_scores[0, 0, :64],
+                            "kv": kv_latent[0, 0],
                         },
                     )
                     print("[GLM_DSA_TRACE] dumped /tmp/l3.safetensors")
