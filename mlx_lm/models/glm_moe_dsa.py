@@ -233,9 +233,11 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 f"splitK_finite={split_ok}"
             )
             if not fout_ok and pe_scores.shape[-1] == 32768:
-                # Dump the actual tensors (bf16, no fp16 conversion which
-                # overflows finfo.min -> -inf) for offline reproduction.
+                # Dump the actual tensors + unembed_out quantized weight so the
+                # v-projection matmul (which yields +inf at key 0) is fully
+                # reproducible offline.
                 try:
+                    ub = getattr(self.unembed_out, "biases", None)
                     mx.save_safetensors(
                         "/tmp/l3.safetensors",
                         {
@@ -245,6 +247,12 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                             "k": k[0, 0],
                             "pe": pe_scores[0, 0, :64],
                             "kv": kv_latent[0, 0],
+                            "unembed_w": self.unembed_out.weight,
+                            "unembed_s": self.unembed_out.scales,
+                            "unembed_b": ub if ub is not None else mx.zeros(
+                                (self.unembed_out.weight.shape[0],),
+                                dtype=self.unembed_out.scales.dtype,
+                            ),
                         },
                     )
                     print("[GLM_DSA_TRACE] dumped /tmp/l3.safetensors")
